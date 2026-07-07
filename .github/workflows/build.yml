@@ -36,8 +36,9 @@ jobs:
         id: version
         run: |
           set -euo pipefail
-          # Latest release tag, if any (semver-sorted).
-          latest="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n1 || true)"
+          # Latest release tag, if any (semver-sorted). Releases use bare
+          # tags (e.g. 7.5.13); the legacy v-prefixed 3.x tags are ignored.
+          latest="$(git tag -l '[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n1 || true)"
           if [ -z "$latest" ]; then
             # No tags yet: seed from the version declared in build.gradle.kts.
             base="$(grep -m1 -E '^version = ' build.gradle.kts | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+).*"/\1/')"
@@ -53,7 +54,7 @@ jobs:
           fi
           echo "Building version $version (previous tag: ${latest:-none})"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$version" >> "$GITHUB_OUTPUT"
 
       - name: Set project version
         run: |
