@@ -1,8 +1,17 @@
-name: build
+name: Build and Release
 on:
   push:
     branches:
       - main
+
+# Prevent overlapping runs from racing on tag/version numbers.
+concurrency:
+  group: build-and-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
 jobs:
   build:
     if: github.repository_owner == 'MCCitiesClone'
@@ -10,58 +19,67 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
       - name: Validate Gradle Wrapper
         uses: gradle/actions/wrapper-validation@v6
+
       - name: Setup Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
+
+      - name: Determine next version
+        id: version
+        run: |
+          set -euo pipefail
+          # Latest release tag, if any (semver-sorted).
+          latest="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n1 || true)"
+          if [ -z "$latest" ]; then
+            # No tags yet: seed from the version declared in build.gradle.kts.
+            base="$(grep -m1 -E '^version = ' build.gradle.kts | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+).*"/\1/')"
+            version="$base"
+          else
+            # Bump the patch component of the latest tag.
+            v="${latest#v}"
+            major="${v%%.*}"
+            rest="${v#*.}"
+            minor="${rest%%.*}"
+            patch="${rest#*.}"
+            version="${major}.${minor}.$((patch + 1))"
+          fi
+          echo "Building version $version (previous tag: ${latest:-none})"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set project version
+        run: |
+          set -euo pipefail
+          sed -i -E "s/^version = \"[^\"]+\"/version = \"${{ steps.version.outputs.version }}\"/" build.gradle.kts
+          grep -E '^version = ' build.gradle.kts
+
       - name: Clean Build
         run: ./gradlew clean build
-      - name: Determine release status
-        if: ${{ runner.os == 'Linux' }}
+
+      - name: Collect artifacts
+        id: artifacts
         run: |
-          if [ "$(./gradlew properties | awk '/^version:/ { print $2; }' | grep '\-SNAPSHOT')" ]; then
-            echo "STATUS=snapshot" >> $GITHUB_ENV
-          else
-            echo "STATUS=release" >> $GITHUB_ENV
-          fi
-      - name: Publish Release
-        if: ${{ runner.os == 'Linux' && env.STATUS == 'release' && github.event_name == 'push' && github.ref == 'refs/heads/main'}}
-        run: ./gradlew publishAndReleaseToMavenCentral --no-configuration-cache
-        env:
-          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.CENTRAL_USERNAME }}
-          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.CENTRAL_PASSWORD }}
-          ORG_GRADLE_PROJECT_signingKey: ${{ secrets.SIGNING_KEY }}
-          ORG_GRADLE_PROJECT_signingPassword: ${{ secrets.SIGNING_PASSWORD }}
-      - name: Publish Snapshot
-        if: ${{ runner.os == 'Linux' && env.STATUS != 'release' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-        run: ./gradlew publishAllPublicationsToMavenCentralRepository
-        env:
-          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.CENTRAL_USERNAME }}
-          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.CENTRAL_PASSWORD }}
-      - name: Publish core javadoc
-        if: ${{ runner.os == 'Linux' && env.STATUS == 'release' && github.event_name == 'push' && github.ref == 'refs/heads/main'}}
-        uses: cpina/github-action-push-to-another-repository@main
-        env:
-          SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+          set -euo pipefail
+          mkdir -p release-artifacts
+          find . -path '*/build/libs/plotsquared-*-${{ steps.version.outputs.version }}.jar' \
+            ! -name '*-sources.jar' ! -name '*-javadoc.jar' \
+            -exec cp -v {} release-artifacts/ \;
+          echo "Artifacts:"
+          ls -1 release-artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          source-directory: 'Core/build/docs/javadoc'
-          destination-github-username: 'IntellectualSites'
-          destination-repository-name: 'plotsquared-javadocs'
-          user-email: ${{ secrets.USER_EMAIL }}
-          target-branch: main
-          target-directory: v7/core
-      - name: Publish bukkit javadoc
-        if: ${{ runner.os == 'Linux' && env.STATUS == 'release' && github.event_name == 'push' && github.ref == 'refs/heads/main'}}
-        uses: cpina/github-action-push-to-another-repository@main
-        env:
-          SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
-        with:
-          source-directory: 'Bukkit/build/docs/javadoc'
-          destination-github-username: 'IntellectualSites'
-          destination-repository-name: 'plotsquared-javadocs'
-          user-email: ${{ secrets.USER_EMAIL }}
-          target-branch: main
-          target-directory: v7/bukkit
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: PlotSquared ${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: release-artifacts/*.jar
